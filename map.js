@@ -36,6 +36,106 @@ function getCoords(station) {
   return { cx: x, cy: y }; // Return as object for use in SVG attributes
 }
 
+// ---------- Time filtering helpers ----------
+
+// Trips grouped by the minute of the day they started / ended (0–1439)
+let departuresByMinute = Array.from({ length: 1440 }, () => []);
+let arrivalsByMinute = Array.from({ length: 1440 }, () => []);
+
+// The currently selected time (-1 = any time)
+let currentTimeFilter = -1;
+
+// Format minutes since midnight as "h:mm AM/PM"
+function formatTime(minutes) {
+  const date = new Date(0, 0, 0, 0, minutes); // Set hours & minutes
+  return date.toLocaleString("en-US", { timeStyle: "short" }); // Format as HH:MM AM/PM
+}
+
+function minutesSinceMidnight(date) {
+  return date.getHours() * 60 + date.getMinutes();
+}
+
+// Get every trip within 60 minutes before or after `minute` from a set of buckets
+function filterByMinute(tripsByMinute, minute) {
+  if (minute === -1) {
+    return tripsByMinute.flat(); // No filtering, return all trips
+  }
+
+  // Normalize both min and max minutes to the valid range [0, 1439]
+  let minMinute = (minute - 60 + 1440) % 1440;
+  let maxMinute = (minute + 60) % 1440;
+
+  // Handle time filtering across midnight
+  if (minMinute > maxMinute) {
+    let beforeMidnight = tripsByMinute.slice(minMinute);
+    let afterMidnight = tripsByMinute.slice(0, maxMinute + 1);
+    return beforeMidnight.concat(afterMidnight).flat();
+  } else {
+    return tripsByMinute.slice(minMinute, maxMinute + 1).flat();
+  }
+}
+
+// Count arrivals, departures, and total traffic for each station
+function computeStationTraffic(stations, timeFilter = -1) {
+  const departures = d3.rollup(
+    filterByMinute(departuresByMinute, timeFilter), // Efficient retrieval
+    (v) => v.length,
+    (d) => d.start_station_id,
+  );
+
+  const arrivals = d3.rollup(
+    filterByMinute(arrivalsByMinute, timeFilter), // Efficient retrieval
+    (v) => v.length,
+    (d) => d.end_station_id,
+  );
+
+  return stations.map((station) => {
+    let id = station.short_name;
+    station.arrivals = arrivals.get(id) ?? 0;
+    station.departures = departures.get(id) ?? 0;
+    station.totalTraffic = station.arrivals + station.departures;
+    return station;
+  });
+}
+
+// Extra tooltip details for one station, from its departures in the current time window.
+// Computed on hover so it always matches the slider.
+function computeStationDetails(stationId, timeFilter) {
+  const v = filterByMinute(departuresByMinute, timeFilter).filter(
+    (d) => d.start_station_id === stationId,
+  );
+  if (v.length === 0) return null;
+
+  const busiest = (rows, key) =>
+    d3.greatest(
+      d3.rollups(rows, (g) => g.length, key),
+      ([, count]) => count,
+    );
+
+  return {
+    memberShare: d3.mean(v, (d) => d.is_member),
+    electricShare: d3.mean(v, (d) => (d.bike_type === "electric" ? 1 : 0)),
+    medianMinutes: d3.median(v, (d) => (d.ended_at - d.started_at) / 60000),
+    peakHour: busiest(v, (d) => d.started_at.getHours())?.[0],
+    topDestination: busiest(
+      v.filter((d) => d.end_station_id !== d.start_station_id),
+      (d) => d.end_station_id,
+    ),
+  };
+}
+
+// Map departure share (0–1) to three flow categories: more arrivals / balanced / more departures
+let stationFlow = d3.scaleQuantize().domain([0, 1]).range([0, 0.5, 1]);
+
+// Departure ratio for coloring; stations with no trips count as balanced
+function departureRatio(d) {
+  return stationFlow(d.totalTraffic ? d.departures / d.totalTraffic : 0.5);
+}
+
+function titleText(d) {
+  return `${d.totalTraffic} trips (${d.departures} departures, ${d.arrivals} arrivals)`;
+}
+
 // Wait for the map to load before adding data
 map.on("load", async () => {
   // Boston bike lanes
@@ -78,74 +178,31 @@ map.on("load", async () => {
     return;
   }
 
-  let stations = jsonData.data.stations;
-  console.log("Stations Array:", stations);
-
-  // Bluebikes traffic for March 2024
+  // Bluebikes traffic for March 2024, sorted into minute-of-day buckets as it loads
   const parseTime = d3.timeParse("%Y-%m-%d %H:%M:%S");
-  const trips = await d3.csv(
+  let trips = await d3.csv(
     "https://dsc106.com/labs/lab07/data/bluebikes-traffic-2024-03.csv",
     (trip) => {
       trip.started_at = parseTime(trip.started_at);
       trip.ended_at = parseTime(trip.ended_at);
       trip.is_member = +trip.is_member;
+
+      let startedMinutes = minutesSinceMidnight(trip.started_at);
+      departuresByMinute[startedMinutes].push(trip);
+
+      let endedMinutes = minutesSinceMidnight(trip.ended_at);
+      arrivalsByMinute[endedMinutes].push(trip);
+
       return trip;
     },
   );
   console.log("Loaded trips:", trips.length);
 
-  // Trip counts per station
-  const departures = d3.rollup(
-    trips,
-    (v) => v.length,
-    (d) => d.start_station_id,
-  );
-
-  const arrivals = d3.rollup(
-    trips,
-    (v) => v.length,
-    (d) => d.end_station_id,
-  );
-
-  // Extra per-station details for the tooltip, based on trips that start there
-  const departureDetails = d3.rollup(
-    trips,
-    (v) => ({
-      memberShare: d3.mean(v, (d) => d.is_member),
-      electricShare: d3.mean(v, (d) => (d.bike_type === "electric" ? 1 : 0)),
-      medianMinutes: d3.median(v, (d) => (d.ended_at - d.started_at) / 60000),
-      peakHour: d3.greatest(
-        d3.rollups(
-          v,
-          (g) => g.length,
-          (d) => d.started_at.getHours(),
-        ),
-        ([, count]) => count,
-      )?.[0],
-      topDestination: d3.greatest(
-        d3.rollups(
-          v.filter((d) => d.end_station_id !== d.start_station_id),
-          (g) => g.length,
-          (d) => d.end_station_id,
-        ),
-        ([, count]) => count,
-      ),
-    }),
-    (d) => d.start_station_id,
-  );
+  const stations = computeStationTraffic(jsonData.data.stations);
+  console.log("Stations with traffic:", stations);
 
   // Look up station names by ID (used for "top destination")
   const stationNames = new Map(stations.map((s) => [s.short_name, s.name]));
-
-  stations = stations.map((station) => {
-    let id = station.short_name;
-    station.arrivals = arrivals.get(id) ?? 0;
-    station.departures = departures.get(id) ?? 0;
-    station.totalTraffic = station.arrivals + station.departures;
-    station.details = departureDetails.get(id) ?? null;
-    return station;
-  });
-  console.log("Stations with traffic:", stations);
 
   // Size circles by area (not radius) so they represent traffic honestly
   const radiusScale = d3
@@ -159,17 +216,14 @@ map.on("load", async () => {
   // Append circles to the SVG for each station
   const circles = svg
     .selectAll("circle")
-    .data(stations)
+    .data(stations, (d) => d.short_name) // Use station short_name as the key
     .enter()
     .append("circle")
     .attr("r", (d) => radiusScale(d.totalTraffic)) // Radius sized by traffic
+    .style("--departure-ratio", departureRatio) // Color by traffic flow
     .each(function (d) {
       // Add <title> for browser tooltips
-      d3.select(this)
-        .append("title")
-        .text(
-          `${d.totalTraffic} trips (${d.departures} departures, ${d.arrivals} arrivals)`,
-        );
+      d3.select(this).append("title").text(titleText(d));
     })
     .on("mouseenter", function (event, d) {
       // Hide the native <title> tooltip while the custom one is showing
@@ -179,13 +233,67 @@ map.on("load", async () => {
     })
     .on("mousemove", moveTooltip)
     .on("mouseleave", function (event, d) {
-      d3.select(this)
-        .select("title")
-        .text(
-          `${d.totalTraffic} trips (${d.departures} departures, ${d.arrivals} arrivals)`,
-        );
+      d3.select(this).select("title").text(titleText(d));
       tooltip.attr("hidden", true);
     });
+
+  // Function to update circle positions when the map moves/zooms
+  function updatePositions() {
+    circles
+      .attr("cx", (d) => getCoords(d).cx) // Set the x-position using projected coordinates
+      .attr("cy", (d) => getCoords(d).cy); // Set the y-position using projected coordinates
+  }
+
+  // Initial position update when map loads
+  updatePositions();
+
+  // Reposition markers on map interactions
+  map.on("move", updatePositions); // Update during map movement
+  map.on("zoom", updatePositions); // Update during zooming
+  map.on("resize", updatePositions); // Update on window resize
+  map.on("moveend", updatePositions); // Final adjustment after movement ends
+
+  // ---------- Time slider ----------
+  const timeSlider = document.getElementById("time-slider");
+  const selectedTime = document.getElementById("selected-time");
+  const anyTimeLabel = document.getElementById("any-time");
+
+  function updateTimeDisplay() {
+    let timeFilter = Number(timeSlider.value); // Get slider value
+
+    if (timeFilter === -1) {
+      selectedTime.textContent = ""; // Clear time display
+      anyTimeLabel.style.display = "block"; // Show "(any time)"
+    } else {
+      selectedTime.textContent = formatTime(timeFilter); // Display formatted time
+      anyTimeLabel.style.display = "none"; // Hide "(any time)"
+    }
+
+    // Call updateScatterPlot to reflect the changes on the map
+    updateScatterPlot(timeFilter);
+  }
+
+  function updateScatterPlot(timeFilter) {
+    currentTimeFilter = timeFilter;
+
+    // Recompute station traffic for the selected time window
+    const filteredStations = computeStationTraffic(stations, timeFilter);
+
+    // Bigger circles when filtering, since there are fewer trips
+    timeFilter === -1 ? radiusScale.range([0, 25]) : radiusScale.range([3, 50]);
+
+    // Update the scatterplot by adjusting the radius of circles
+    circles
+      .data(filteredStations, (d) => d.short_name) // Ensure D3 tracks elements correctly
+      .join("circle")
+      .attr("r", (d) => radiusScale(d.totalTraffic))
+      .style("--departure-ratio", departureRatio)
+      .select("title")
+      .text(titleText);
+  }
+
+  timeSlider.addEventListener("input", updateTimeDisplay);
+  updateTimeDisplay();
 
   // Keep the tooltip next to the cursor, flipping it if it would leave the screen
   function moveTooltip(event) {
@@ -213,16 +321,19 @@ map.on("load", async () => {
         : net > 0
           ? `${fmt(net)} more bikes leave than arrive`
           : `${fmt(-net)} more bikes arrive than leave`;
-    const hourLabel = (h) => {
-      const t = new Date(2024, 0, 1, h);
-      return `${d3.timeFormat("%-I %p")(t)}–${d3.timeFormat("%-I %p")(new Date(2024, 0, 1, h + 1))}`;
-    };
+    const hourFmt = d3.timeFormat("%-I %p");
+    const hourLabel = (h) =>
+      `${hourFmt(new Date(2024, 0, 1, h))}–${hourFmt(new Date(2024, 0, 1, h + 1))}`;
     const share = d.totalTraffic ? d.departures / d.totalTraffic : 0.5;
+    const when =
+      currentTimeFilter === -1
+        ? "in March 2024"
+        : `within an hour of ${formatTime(currentTimeFilter)}`;
 
     let html = `
       <h2>${d.name}</h2>
       <p class="muted">${d.short_name} · ${d.capacity} docks</p>
-      <p class="total"><strong>${fmt(d.totalTraffic)}</strong> trips in March 2024</p>
+      <p class="total"><strong>${fmt(d.totalTraffic)}</strong> trips ${when}</p>
       <div class="flow-bar" aria-hidden="true">
         <span class="dep" style="width:${share * 100}%"></span>
       </div>
@@ -231,14 +342,17 @@ map.on("load", async () => {
         <dt><i class="swatch arr"></i>Arrivals</dt><dd>${fmt(d.arrivals)}</dd>
         <dt>Net flow</dt><dd>${netText}</dd>`;
 
-    if (d.details) {
+    const details = computeStationDetails(d.short_name, currentTimeFilter);
+    if (details) {
       const { memberShare, electricShare, medianMinutes, peakHour, topDestination } =
-        d.details;
+        details;
       html += `
         <dt>Members</dt><dd>${pct(memberShare)} of departures</dd>
         <dt>E-bikes</dt><dd>${pct(electricShare)} of departures</dd>
-        <dt>Typical ride</dt><dd>${Math.round(medianMinutes)} min (median)</dd>
-        <dt>Busiest hour</dt><dd>${hourLabel(peakHour)}</dd>`;
+        <dt>Typical ride</dt><dd>${Math.round(medianMinutes)} min (median)</dd>`;
+      if (currentTimeFilter === -1) {
+        html += `<dt>Busiest hour</dt><dd>${hourLabel(peakHour)}</dd>`;
+      }
       if (topDestination) {
         const [destId, destCount] = topDestination;
         html += `<dt>Top destination</dt><dd>${stationNames.get(destId) ?? destId} (${fmt(destCount)} trips)</dd>`;
@@ -247,20 +361,4 @@ map.on("load", async () => {
 
     return html + "</dl>";
   }
-
-  // Function to update circle positions when the map moves/zooms
-  function updatePositions() {
-    circles
-      .attr("cx", (d) => getCoords(d).cx) // Set the x-position using projected coordinates
-      .attr("cy", (d) => getCoords(d).cy); // Set the y-position using projected coordinates
-  }
-
-  // Initial position update when map loads
-  updatePositions();
-
-  // Reposition markers on map interactions
-  map.on("move", updatePositions); // Update during map movement
-  map.on("zoom", updatePositions); // Update during zooming
-  map.on("resize", updatePositions); // Update on window resize
-  map.on("moveend", updatePositions); // Final adjustment after movement ends
 });

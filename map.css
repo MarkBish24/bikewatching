@@ -25,9 +25,22 @@ body {
   pointer-events: none; /* Let mouse events pass through to the map */
 }
 
+/* Flow colors, shared by the station markers and the legend.
+   --departure-ratio is 1 (more departures), 0.5 (balanced) or 0 (more arrivals). */
+#map svg circle,
+.legend > div {
+  --color-departures: steelblue;
+  --color-arrivals: darkorange;
+  --color: color-mix(
+    in oklch,
+    var(--color-departures) calc(100% * var(--departure-ratio)),
+    var(--color-arrivals)
+  );
+}
+
 /* Station markers: semi-transparent so overlapping circles stay readable */
 #map svg circle {
-  fill: steelblue;
+  fill: var(--color);
   fill-opacity: 60%;
   stroke: white;
   stroke-width: 1;
@@ -123,4 +136,62 @@ body {
 
 #tooltip .swatch.arr {
   background: darkorange;
+}
+
+/* Header: title on the left, time filter pushed to the right */
+header {
+  display: flex;
+  gap: 1em;
+  align-items: baseline;
+  width: 100%;
+}
+
+header label {
+  margin-left: auto;
+}
+
+#time-slider {
+  width: 20em;
+  max-width: 50vw;
+}
+
+/* Put the time readout on its own line so the slider doesn't jump around */
+#selected-time,
+#any-time {
+  display: block;
+  text-align: right;
+}
+
+#any-time {
+  color: #8a94a0;
+  font-style: italic;
+}
+
+/* Legend: swatches with labels (design 2) */
+.legend {
+  display: flex;
+  align-items: center;
+  gap: 1.5em;
+  margin-block: 0.75em;
+  width: 100%;
+  font-size: 0.9rem;
+}
+
+.legend-title {
+  color: #6b7785;
+}
+
+.legend > div {
+  display: flex;
+  align-items: center;
+  gap: 0.4em; /* Much smaller than the parent gap so each swatch stays with its label */
+}
+
+.legend > div::before {
+  content: "";
+  width: 1em;
+  height: 1em;
+  border-radius: 50%;
+  background: var(--color);
+  opacity: 0.8;
 }
