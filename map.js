@@ -81,17 +81,172 @@ map.on("load", async () => {
   let stations = jsonData.data.stations;
   console.log("Stations Array:", stations);
 
+  // Bluebikes traffic for March 2024
+  const parseTime = d3.timeParse("%Y-%m-%d %H:%M:%S");
+  const trips = await d3.csv(
+    "https://dsc106.com/labs/lab07/data/bluebikes-traffic-2024-03.csv",
+    (trip) => {
+      trip.started_at = parseTime(trip.started_at);
+      trip.ended_at = parseTime(trip.ended_at);
+      trip.is_member = +trip.is_member;
+      return trip;
+    },
+  );
+  console.log("Loaded trips:", trips.length);
+
+  // Trip counts per station
+  const departures = d3.rollup(
+    trips,
+    (v) => v.length,
+    (d) => d.start_station_id,
+  );
+
+  const arrivals = d3.rollup(
+    trips,
+    (v) => v.length,
+    (d) => d.end_station_id,
+  );
+
+  // Extra per-station details for the tooltip, based on trips that start there
+  const departureDetails = d3.rollup(
+    trips,
+    (v) => ({
+      memberShare: d3.mean(v, (d) => d.is_member),
+      electricShare: d3.mean(v, (d) => (d.bike_type === "electric" ? 1 : 0)),
+      medianMinutes: d3.median(v, (d) => (d.ended_at - d.started_at) / 60000),
+      peakHour: d3.greatest(
+        d3.rollups(
+          v,
+          (g) => g.length,
+          (d) => d.started_at.getHours(),
+        ),
+        ([, count]) => count,
+      )?.[0],
+      topDestination: d3.greatest(
+        d3.rollups(
+          v.filter((d) => d.end_station_id !== d.start_station_id),
+          (g) => g.length,
+          (d) => d.end_station_id,
+        ),
+        ([, count]) => count,
+      ),
+    }),
+    (d) => d.start_station_id,
+  );
+
+  // Look up station names by ID (used for "top destination")
+  const stationNames = new Map(stations.map((s) => [s.short_name, s.name]));
+
+  stations = stations.map((station) => {
+    let id = station.short_name;
+    station.arrivals = arrivals.get(id) ?? 0;
+    station.departures = departures.get(id) ?? 0;
+    station.totalTraffic = station.arrivals + station.departures;
+    station.details = departureDetails.get(id) ?? null;
+    return station;
+  });
+  console.log("Stations with traffic:", stations);
+
+  // Size circles by area (not radius) so they represent traffic honestly
+  const radiusScale = d3
+    .scaleSqrt()
+    .domain([0, d3.max(stations, (d) => d.totalTraffic)])
+    .range([0, 25]);
+
+  // Custom tooltip element
+  const tooltip = d3.select("#tooltip");
+
   // Append circles to the SVG for each station
   const circles = svg
     .selectAll("circle")
     .data(stations)
     .enter()
     .append("circle")
-    .attr("r", 5) // Radius of the circle
-    .attr("fill", "steelblue") // Circle fill color
-    .attr("stroke", "white") // Circle border color
-    .attr("stroke-width", 1) // Circle border thickness
-    .attr("opacity", 0.8); // Circle opacity
+    .attr("r", (d) => radiusScale(d.totalTraffic)) // Radius sized by traffic
+    .each(function (d) {
+      // Add <title> for browser tooltips
+      d3.select(this)
+        .append("title")
+        .text(
+          `${d.totalTraffic} trips (${d.departures} departures, ${d.arrivals} arrivals)`,
+        );
+    })
+    .on("mouseenter", function (event, d) {
+      // Hide the native <title> tooltip while the custom one is showing
+      d3.select(this).select("title").text("");
+      tooltip.html(tooltipHTML(d)).attr("hidden", null);
+      moveTooltip(event);
+    })
+    .on("mousemove", moveTooltip)
+    .on("mouseleave", function (event, d) {
+      d3.select(this)
+        .select("title")
+        .text(
+          `${d.totalTraffic} trips (${d.departures} departures, ${d.arrivals} arrivals)`,
+        );
+      tooltip.attr("hidden", true);
+    });
+
+  // Keep the tooltip next to the cursor, flipping it if it would leave the screen
+  function moveTooltip(event) {
+    const node = tooltip.node();
+    const pad = 14;
+    let x = event.clientX + pad;
+    let y = event.clientY + pad;
+    if (x + node.offsetWidth > window.innerWidth) {
+      x = event.clientX - node.offsetWidth - pad;
+    }
+    if (y + node.offsetHeight > window.innerHeight) {
+      y = event.clientY - node.offsetHeight - pad;
+    }
+    tooltip.style("left", `${x}px`).style("top", `${y}px`);
+  }
+
+  // Build the tooltip contents for one station
+  function tooltipHTML(d) {
+    const fmt = d3.format(",");
+    const pct = d3.format(".0%");
+    const net = d.departures - d.arrivals;
+    const netText =
+      net === 0
+        ? "Balanced"
+        : net > 0
+          ? `${fmt(net)} more bikes leave than arrive`
+          : `${fmt(-net)} more bikes arrive than leave`;
+    const hourLabel = (h) => {
+      const t = new Date(2024, 0, 1, h);
+      return `${d3.timeFormat("%-I %p")(t)}–${d3.timeFormat("%-I %p")(new Date(2024, 0, 1, h + 1))}`;
+    };
+    const share = d.totalTraffic ? d.departures / d.totalTraffic : 0.5;
+
+    let html = `
+      <h2>${d.name}</h2>
+      <p class="muted">${d.short_name} · ${d.capacity} docks</p>
+      <p class="total"><strong>${fmt(d.totalTraffic)}</strong> trips in March 2024</p>
+      <div class="flow-bar" aria-hidden="true">
+        <span class="dep" style="width:${share * 100}%"></span>
+      </div>
+      <dl>
+        <dt><i class="swatch dep"></i>Departures</dt><dd>${fmt(d.departures)}</dd>
+        <dt><i class="swatch arr"></i>Arrivals</dt><dd>${fmt(d.arrivals)}</dd>
+        <dt>Net flow</dt><dd>${netText}</dd>`;
+
+    if (d.details) {
+      const { memberShare, electricShare, medianMinutes, peakHour, topDestination } =
+        d.details;
+      html += `
+        <dt>Members</dt><dd>${pct(memberShare)} of departures</dd>
+        <dt>E-bikes</dt><dd>${pct(electricShare)} of departures</dd>
+        <dt>Typical ride</dt><dd>${Math.round(medianMinutes)} min (median)</dd>
+        <dt>Busiest hour</dt><dd>${hourLabel(peakHour)}</dd>`;
+      if (topDestination) {
+        const [destId, destCount] = topDestination;
+        html += `<dt>Top destination</dt><dd>${stationNames.get(destId) ?? destId} (${fmt(destCount)} trips)</dd>`;
+      }
+    }
+
+    return html + "</dl>";
+  }
 
   // Function to update circle positions when the map moves/zooms
   function updatePositions() {
