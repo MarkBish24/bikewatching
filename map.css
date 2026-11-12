@@ -31,8 +31,9 @@ body {
 .legend > div {
   --color-departures: steelblue;
   --color-arrivals: darkorange;
+  /* oklab (not oklch) so "balanced" is a neutral mix instead of swinging through pink */
   --color: color-mix(
-    in oklch,
+    in oklab,
     var(--color-departures) calc(100% * var(--departure-ratio)),
     var(--color-arrivals)
   );
@@ -171,14 +172,22 @@ header label {
 .legend {
   display: flex;
   align-items: center;
-  gap: 1.5em;
+  justify-content: center;
+  gap: 1.75em;
   margin-block: 0.75em;
-  width: 100%;
+  padding: 0.5em 1.25em;
+  border: 1px solid #e3e7eb;
+  border-radius: 999px;
+  background: #fff;
   font-size: 0.9rem;
 }
 
 .legend-title {
   color: #6b7785;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 0.75rem;
 }
 
 .legend > div {
@@ -194,4 +203,5 @@ header label {
   border-radius: 50%;
   background: var(--color);
   opacity: 0.8;
+  box-shadow: 0 0 0 1px white, 0 0 0 2px rgba(0, 0, 0, 0.08); /* Matches the white-outlined markers */
 }
